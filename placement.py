@@ -463,3 +463,360 @@ def train_placement(
         "initial_cell_features": initial_cell_features,
         "loss_history": loss_history,
     }
+
+# ============== FINAL EVALUATION CODE  ==============
+
+def calculate_overlap_metrics(cell_features):
+    """Calculate ground truth overlap statistics (non-differentiable).
+
+    This function provides exact overlap measurements for evaluation and reporting.
+    Unlike the loss function, this does NOT need to be differentiable.
+
+    Args:
+        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
+
+    Returns:
+        Dictionary with:
+            - overlap_count: number of overlapping cell pairs (int)
+            - total_overlap_area: sum of all overlap areas (float)
+            - max_overlap_area: largest single overlap area (float)
+            - overlap_percentage: percentage of total area that overlaps (float)
+    """
+    N = cell_features.shape[0]
+    if N <= 1:
+        return {
+            "overlap_count": 0,
+            "total_overlap_area": 0.0,
+            "max_overlap_area": 0.0,
+            "overlap_percentage": 0.0,
+        }
+
+    # Extract cell properties
+    positions = cell_features[:, 2:4].detach().numpy()  # [N, 2]
+    widths = cell_features[:, 4].detach().numpy()  # [N]
+    heights = cell_features[:, 5].detach().numpy()  # [N]
+    areas = cell_features[:, 0].detach().numpy()  # [N]
+
+    overlap_count = 0
+    total_overlap_area = 0.0
+    max_overlap_area = 0.0
+    overlap_areas = []
+
+    # Check all pairs
+    for i in range(N):
+        for j in range(i + 1, N):
+            # Calculate center-to-center distances
+            dx = abs(positions[i, 0] - positions[j, 0])
+            dy = abs(positions[i, 1] - positions[j, 1])
+
+            # Minimum separation for non-overlap
+            min_sep_x = (widths[i] + widths[j]) / 2
+            min_sep_y = (heights[i] + heights[j]) / 2
+
+            # Calculate overlap amounts
+            overlap_x = max(0, min_sep_x - dx)
+            overlap_y = max(0, min_sep_y - dy)
+
+            # Overlap occurs only if both x and y overlap
+            if overlap_x > 0 and overlap_y > 0:
+                overlap_area = overlap_x * overlap_y
+                overlap_count += 1
+                total_overlap_area += overlap_area
+                max_overlap_area = max(max_overlap_area, overlap_area)
+                overlap_areas.append(overlap_area)
+
+    # Calculate percentage of total area
+    total_area = sum(areas)
+    overlap_percentage = (overlap_count / N * 100) if total_area > 0 else 0.0
+
+    return {
+        "overlap_count": overlap_count,
+        "total_overlap_area": total_overlap_area,
+        "max_overlap_area": max_overlap_area,
+        "overlap_percentage": overlap_percentage,
+    }
+
+
+def calculate_cells_with_overlaps(cell_features):
+    """Calculate number of cells involved in at least one overlap.
+
+    This metric matches the test suite evaluation criteria.
+
+    Args:
+        cell_features: [N, 6] tensor with cell properties
+
+    Returns:
+        Set of cell indices that have overlaps with other cells
+    """
+    N = cell_features.shape[0]
+    if N <= 1:
+        return set()
+
+    # Extract cell properties
+    positions = cell_features[:, 2:4].detach().numpy()
+    widths = cell_features[:, 4].detach().numpy()
+    heights = cell_features[:, 5].detach().numpy()
+
+    cells_with_overlaps = set()
+
+    # Check all pairs
+    for i in range(N):
+        for j in range(i + 1, N):
+            # Calculate center-to-center distances
+            dx = abs(positions[i, 0] - positions[j, 0])
+            dy = abs(positions[i, 1] - positions[j, 1])
+
+            # Minimum separation for non-overlap
+            min_sep_x = (widths[i] + widths[j]) / 2
+            min_sep_y = (heights[i] + heights[j]) / 2
+
+            # Calculate overlap amounts
+            overlap_x = max(0, min_sep_x - dx)
+            overlap_y = max(0, min_sep_y - dy)
+
+            # Overlap occurs only if both x and y overlap
+            if overlap_x > 0 and overlap_y > 0:
+                cells_with_overlaps.add(i)
+                cells_with_overlaps.add(j)
+
+    return cells_with_overlaps
+
+
+def calculate_normalized_metrics(cell_features, pin_features, edge_list):
+    """Calculate normalized overlap and wirelength metrics for test suite.
+
+    These metrics match the evaluation criteria in the test suite.
+
+    Args:
+        cell_features: [N, 6] tensor with cell properties
+        pin_features: [P, 7] tensor with pin properties
+        edge_list: [E, 2] tensor with edge connectivity
+
+    Returns:
+        Dictionary with:
+            - overlap_ratio: (num cells with overlaps / total cells)
+            - normalized_wl: (wirelength / num nets) / sqrt(total area)
+            - num_cells_with_overlaps: number of unique cells involved in overlaps
+            - total_cells: total number of cells
+            - num_nets: number of nets (edges)
+    """
+    N = cell_features.shape[0]
+
+    # Calculate overlap metric: num cells with overlaps / total cells
+    cells_with_overlaps = calculate_cells_with_overlaps(cell_features)
+    num_cells_with_overlaps = len(cells_with_overlaps)
+    overlap_ratio = num_cells_with_overlaps / N if N > 0 else 0.0
+
+    # Calculate wirelength metric: (wirelength / num nets) / sqrt(total area)
+    if edge_list.shape[0] == 0:
+        normalized_wl = 0.0
+        num_nets = 0
+    else:
+        # Calculate total wirelength using the loss function (unnormalized)
+        wl_loss = wirelength_attraction_loss(cell_features, pin_features, edge_list)
+        total_wirelength = wl_loss.item() * edge_list.shape[0]  # Undo normalization
+
+        # Calculate total area
+        total_area = cell_features[:, 0].sum().item()
+
+        num_nets = edge_list.shape[0]
+
+        # Normalize: (wirelength / net) / sqrt(area)
+        # This gives a dimensionless quality metric independent of design size
+        normalized_wl = (total_wirelength / num_nets) / (total_area ** 0.5) if total_area > 0 else 0.0
+
+    return {
+        "overlap_ratio": overlap_ratio,
+        "normalized_wl": normalized_wl,
+        "num_cells_with_overlaps": num_cells_with_overlaps,
+        "total_cells": N,
+        "num_nets": num_nets,
+    }
+
+
+def plot_placement(
+    initial_cell_features,
+    final_cell_features,
+    pin_features,
+    edge_list,
+    filename="placement_result.png",
+):
+    """Create side-by-side visualization of initial vs final placement.
+
+    Args:
+        final_cell_features: Optimized cell positions and properties
+        pin_features: Pin information
+        edge_list: Edge connectivity
+        filename: Output filename for the plot
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+        # Plot both initial and final placements
+        for ax, cell_features, title in [
+            (ax1, initial_cell_features, "Initial Placement"),
+            (ax2, final_cell_features, "Final Placement"),
+        ]:
+            N = cell_features.shape[0]
+            positions = cell_features[:, 2:4].detach().numpy()
+            widths = cell_features[:, 4].detach().numpy()
+            heights = cell_features[:, 5].detach().numpy()
+
+            # Draw cells
+            for i in range(N):
+                x = positions[i, 0] - widths[i] / 2
+                y = positions[i, 1] - heights[i] / 2
+                rect = Rectangle(
+                    (x, y),
+                    widths[i],
+                    heights[i],
+                    fill=True,
+                    facecolor="lightblue",
+                    edgecolor="darkblue",
+                    linewidth=0.5,
+                    alpha=0.7,
+                )
+                ax.add_patch(rect)
+
+            # Calculate and display overlap metrics
+            metrics = calculate_overlap_metrics(cell_features)
+
+            ax.set_aspect("equal")
+            ax.grid(True, alpha=0.3)
+            ax.set_title(
+                f"{title}\n"
+                f"Overlaps: {metrics['overlap_count']}, "
+                f"Total Overlap Area: {metrics['total_overlap_area']:.2f}",
+                fontsize=12,
+            )
+
+            # Set axis limits with margin
+            all_x = positions[:, 0]
+            all_y = positions[:, 1]
+            margin = 10
+            ax.set_xlim(all_x.min() - margin, all_x.max() + margin)
+            ax.set_ylim(all_y.min() - margin, all_y.max() + margin)
+
+        plt.tight_layout()
+        output_path = os.path.join(OUTPUT_DIR, filename)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close()
+
+    except ImportError as e:
+        print(f"Could not create visualization: {e}")
+        print("Install matplotlib to enable visualization: pip install matplotlib")
+
+# ============== MAIN FUNCTION ==============
+
+def main():
+    """Main function demonstrating the placement optimization."""
+    print("=" * 70)
+    print("VLSI CELL PLACEMENT OPTIMIZATION ")
+    print("=" * 70)
+    print("\nObjective: Implement overlap_repulsion_loss() to eliminate cell overlaps")
+    print("while minimizing wirelength.\n")
+
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+
+    # Generate placement problem
+    num_macros = 3
+    num_std_cells = 50
+
+    print(f"Generating placement problem:")
+    print(f"  - {num_macros} macros")
+    print(f"  - {num_std_cells} standard cells")
+
+    cell_features, pin_features, edge_list = generate_placement_input(
+        num_macros, num_std_cells
+    )
+
+    # Initialize positions with random spread to reduce initial overlaps
+    total_cells = cell_features.shape[0]
+    spread_radius = 30.0
+    angles = torch.rand(total_cells) * 2 * 3.14159
+    radii = torch.rand(total_cells) * spread_radius
+
+    cell_features[:, 2] = radii * torch.cos(angles)
+    cell_features[:, 3] = radii * torch.sin(angles)
+
+    # Calculate initial metrics
+    print("\n" + "=" * 70)
+    print("INITIAL STATE")
+    print("=" * 70)
+    initial_metrics = calculate_overlap_metrics(cell_features)
+    print(f"Overlap count: {initial_metrics['overlap_count']}")
+    print(f"Total overlap area: {initial_metrics['total_overlap_area']:.2f}")
+    print(f"Max overlap area: {initial_metrics['max_overlap_area']:.2f}")
+    print(f"Overlap percentage: {initial_metrics['overlap_percentage']:.2f}%")
+
+    # Run optimization
+    print("\n" + "=" * 70)
+    print("RUNNING OPTIMIZATION")
+    print("=" * 70)
+
+    result = train_placement(
+        "test",
+        cell_features,
+        pin_features,
+        edge_list,
+        verbose=True,
+        log_interval=200,
+    )
+
+    # Calculate final metrics (both detailed and normalized)
+    print("\n" + "=" * 70)
+    print("FINAL RESULTS")
+    print("=" * 70)
+
+    final_cell_features = result["final_cell_features"]
+
+    # Detailed metrics
+    final_metrics = calculate_overlap_metrics(final_cell_features)
+    print(f"Overlap count (pairs): {final_metrics['overlap_count']}")
+    print(f"Total overlap area: {final_metrics['total_overlap_area']:.2f}")
+    print(f"Max overlap area: {final_metrics['max_overlap_area']:.2f}")
+
+    # Normalized metrics (matching test suite)
+    print("\n" + "-" * 70)
+    print("TEST SUITE METRICS ")
+    print("-" * 70)
+    normalized_metrics = calculate_normalized_metrics(
+        final_cell_features, pin_features, edge_list
+    )
+    print(f"Overlap Ratio: {normalized_metrics['overlap_ratio']:.4f} "
+          f"({normalized_metrics['num_cells_with_overlaps']}/{normalized_metrics['total_cells']} cells)")
+    print(f"Normalized Wirelength: {normalized_metrics['normalized_wl']:.4f}")
+
+    # Success check
+    print("\n" + "=" * 70)
+    print("SUCCESS CRITERIA")
+    print("=" * 70)
+    if normalized_metrics["num_cells_with_overlaps"] == 0:
+        print("✓ PASS: No overlapping cells!")
+        print("✓ PASS: Overlap ratio is 0.0")
+        print("\nCongratulations! Your implementation successfully eliminated all overlaps.")
+        print(f"Your normalized wirelength: {normalized_metrics['normalized_wl']:.4f}")
+    else:
+        print("✗ FAIL: Overlaps still exist")
+        print(f"  Need to eliminate overlaps in {normalized_metrics['num_cells_with_overlaps']} cells")
+        print("\nSuggestions:")
+        print("  1. Check your overlap_repulsion_loss() implementation")
+        print("  2. Change lambdas (try increasing lambda_overlap)")
+        print("  3. Change learning rate or number of epochs")
+
+    # Generate visualization
+    plot_placement(
+        result["initial_cell_features"],
+        result["final_cell_features"],
+        pin_features,
+        edge_list,
+        filename="placement_result.png",
+    )
+
+if __name__ == "__main__":
+    main()
