@@ -197,3 +197,269 @@ def generate_placement_input(num_macros, num_std_cells):
 
     return cell_features, pin_features, edge_list
 
+
+# ===================== OPTIMIZATION CODE ===================================
+
+def wirelength_attraction_loss(cell_features, pin_features, edge_list):
+    """Calculate loss based on total wirelength to minimize routing.
+
+    This is a REFERENCE IMPLEMENTATION showing how to write a differentiable loss function.
+
+    The loss computes the Manhattan distance between connected pins and minimizes
+    the total wirelength across all edges.
+
+    Args:
+        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
+        pin_features: [P, 7] tensor with pin information
+        edge_list: [E, 2] tensor with edges
+
+    Returns:
+        Scalar loss value
+    """
+    if edge_list.shape[0] == 0:
+        return torch.tensor(0.0, requires_grad=True)
+
+    # Update absolute pin positions based on cell positions
+    cell_positions = cell_features[:, 2:4]  # [N, 2]
+    cell_indices = pin_features[:, 0].long()
+
+    # Calculate absolute pin positions
+    pin_absolute_x = cell_positions[cell_indices, 0] + pin_features[:, 1]
+    pin_absolute_y = cell_positions[cell_indices, 1] + pin_features[:, 2]
+
+    # Get source and target pin positions for each edge
+    src_pins = edge_list[:, 0].long()
+    tgt_pins = edge_list[:, 1].long()
+
+    src_x = pin_absolute_x[src_pins]
+    src_y = pin_absolute_y[src_pins]
+    tgt_x = pin_absolute_x[tgt_pins]
+    tgt_y = pin_absolute_y[tgt_pins]
+
+    # Calculate smooth approximation of Manhattan distance
+    # Using log-sum-exp approximation for differentiability
+    alpha = 0.1  # Smoothing parameter
+    dx = torch.abs(src_x - tgt_x)
+    dy = torch.abs(src_y - tgt_y)
+
+    # Smooth L1 distance with numerical stability
+    smooth_manhattan = alpha * torch.logsumexp(
+        torch.stack([dx / alpha, dy / alpha], dim=0), dim=0
+    )
+
+    # Total wirelength
+    total_wirelength = torch.sum(smooth_manhattan)
+
+    return total_wirelength / edge_list.shape[0]  # Normalize by number of edges
+
+def overlap_repulsion_loss(cell_features, pin_features, edge_list, epoch_progress):
+    """
+    Best approach so far: Compute a differentiable overlap loss for VLSI cell placement using a
+    soft-Coulomb repulsion field and smooth overlap barriers.
+
+    This function penalizes cell overlaps (primary objective) while applying a
+    mild global compression field to encourage compact placements. It operates
+    in O(N²) time by computing pairwise interactions between all cells.
+
+    Components:
+    1. Smooth Overlap Barrier (Main Term):
+       - Uses a differentiable approximation of overlap area between each pair of cells.
+       - The overlap is measured along both x and y axes using `softplus` for
+         smooth gradient behavior.
+       - The penalty increases quadratically with overlap area, ensuring that
+         even small overlaps receive a strong push apart.
+       - The sharpness of the barrier (Beta) increases with training progress
+         (`epoch_progress`) to transition from soft to hard separation.
+
+    2. Soft Coulomb Field (Auxiliary Term):
+       - Adds a gentle global repulsion field that decays proportionally to
+         my decaying field where `r` is pairwise distance.
+       - Helps spread cells evenly early in training, reducing large-scale clustering.
+       - The smoothing factor sigma is annealed to shrink over time, allowing tighter
+         packing as training progresses.
+
+    Args:
+        cell_features (torch.Tensor): Tensor of shape [N, 6] containing
+            [area, num_pins, x, y, width, height] for each cell.
+        pin_features (torch.Tensor): Unused in this function (for compatibility).
+        edge_list (torch.Tensor): Unused in this function (for compatibility).
+        epoch_progress (float or torch.Tensor): Scalar in [0, 1] controlling
+            annealing sharpness and field smoothing.
+
+    Returns:
+        torch.Tensor: Scalar loss combining overlap and field penalties.
+            Lower is better (zero indicates no overlap).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    N = cell_features.shape[0]
+    dev = cell_features.device
+
+    # Handle trivial case with no or single cell
+    if N <= 1:
+        return torch.tensor(0.0, device=dev, requires_grad=True)
+
+    # Extract cell geometry 
+    x, y = cell_features[:, 2], cell_features[:, 3]  # positions
+    w, h = cell_features[:, 4], cell_features[:, 5]  # sizes
+
+    # Compute pairwise deltas (broadcasted) 
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    mask = 1.0 - torch.eye(N, device=dev)  # ignore self-pairs
+
+    # Minimum required separations along each axis 
+    minx = 0.5 * (w[:, None] + w[None, :])
+    miny = 0.5 * (h[:, None] + h[None, :])
+
+    # Smooth Overlap Barrier 
+    ep = torch.as_tensor(epoch_progress, dtype=torch.float32, device=dev)
+    beta = 0.1 + 4.0 * (ep ** 2)  # annealed sharpness for softplus
+    ox = F.softplus(minx - dx.abs(), beta=beta)  # soft overlap extent in x
+    oy = F.softplus(miny - dy.abs(), beta=beta)  # soft overlap extent in y
+
+    # Quadratic penalty on smooth overlap area
+    overlap_area = (ox * oy) ** 2
+    overlap_loss = (overlap_area * mask).sum()
+
+    # Soft Coulomb Field (Global Repulsion) 
+    dist_sq = dx * dx + dy * dy + 1e-6  # pairwise squared distances
+    sigma = (w.mean() + h.mean()) * (0.4 + 0.6 * (1 - ep))  # annealed smoothing width
+    coulomb = (1.0 / (dist_sq + sigma**2)) * mask  # decaying field
+    field_loss = coulomb.sum() * 1e-3  # small weighting for global spread
+
+    # Total Loss 
+    return overlap_loss + field_loss
+
+
+def train_placement(
+    id_str,
+    cell_features,
+    pin_features,
+    edge_list,
+    num_epochs=1000,
+    lr=0.01,
+    lambda_wirelength=1.0,
+    lambda_overlap=10.0,
+    verbose=True,
+    log_interval=100,
+):
+    """Train the placement optimization using gradient descent.
+
+    Args:
+        cell_features: [N, 6] tensor with cell properties
+        pin_features: [P, 7] tensor with pin properties
+        edge_list: [E, 2] tensor with edge connectivity
+        num_epochs: Number of optimization iterations
+        lr: Learning rate for Adam optimizer
+        lambda_wirelength: Weight for wirelength loss
+        lambda_overlap: Weight for overlap loss
+        verbose: Whether to print progress
+        log_interval: How often to print progress
+
+    Returns:
+        Dictionary with:
+            - final_cell_features: Optimized cell positions
+            - initial_cell_features: Original cell positions (for comparison)
+            - loss_history: Loss values over time
+    """
+    # Clone features and create learnable positions
+    cell_features = cell_features.clone()
+    initial_cell_features = cell_features.clone()
+
+    # Make only cell positions require gradients
+    # Turn off grad for everything except cell_positions
+    cell_features = cell_features.clone().detach()
+    cell_features.requires_grad_(False)
+    cell_positions = cell_features[:, 2:4].clone().detach()
+    cell_positions.requires_grad_(True)
+
+    # Create optimizer
+    optimizer = optim.Adam([cell_positions], lr=lr)
+
+    # Track loss history
+    loss_history = {
+        "total_loss": [],
+        "wirelength_loss": [],
+        "overlap_loss": [],
+    }
+
+    # Training loop
+    for epoch in range(num_epochs):
+        if epoch < num_epochs / 10:
+            lambda_overlap = 0
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 2.0  # High starting learning rate
+
+        elif epoch > 4 * num_epochs / 5:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.4  # Low ending learning rate
+                lambda_overlap = 1
+        else:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.5
+            lambda_overlap = 4 * (epoch / num_epochs) ** 10
+            
+            
+        optimizer.zero_grad()
+
+        # Create cell_features with current positions
+        cell_features_current = cell_features.clone()
+        cell_features_current[:, 2:4] = cell_positions
+
+        # Calculate losses
+        wl_loss = wirelength_attraction_loss(
+            cell_features_current, pin_features, edge_list
+        )
+        overlap_loss = overlap_repulsion_loss(
+            cell_features_current, pin_features, edge_list, epoch / num_epochs
+        )
+        
+        # Combined loss
+        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+
+        # Backward pass
+        total_loss.backward()
+
+        # Gradient clipping to prevent extreme updates
+        torch.nn.utils.clip_grad_norm_([cell_positions], max_norm=5.0)
+
+        # Update positions
+        optimizer.step()
+        
+        # jitter the positions slightly to prevent getting stuck in local minima
+        # cell_positions.data += torch.randn_like(cell_positions.data) * 0.01 * (1 - (epoch / num_epochs))
+
+        # Record losses
+        loss_history["total_loss"].append(total_loss.item())
+        loss_history["wirelength_loss"].append(wl_loss.item())
+        loss_history["overlap_loss"].append(overlap_loss.item())
+
+        # Log progress
+        if verbose and (epoch % log_interval == 0 or epoch == num_epochs - 1):
+            print(f"Epoch {epoch}/{num_epochs}:")
+            print(f"  Total Loss: {total_loss.item():.6f}")
+            print(f"  Wirelength Loss: {wl_loss.item():.6f}")
+            print(f"  Overlap Loss: {overlap_loss.item():.6f}")
+
+        if epoch % 100 == 0 or epoch == num_epochs - 1:
+            filename = f"vis/{id_str}/placement_epoch_{epoch}_wl_{wl_loss.item():.4f}_ol_{overlap_loss.item():.4f}.png"
+            plot_placement(
+                initial_cell_features=initial_cell_features,
+                final_cell_features=cell_features_current,
+                pin_features=pin_features,
+                edge_list=edge_list,
+                filename=filename,
+            )
+        
+
+    # Create final cell features
+    final_cell_features = cell_features.clone()
+    final_cell_features[:, 2:4] = cell_positions.detach()
+
+    return {
+        "final_cell_features": final_cell_features,
+        "initial_cell_features": initial_cell_features,
+        "loss_history": loss_history,
+    }
