@@ -1,14 +1,15 @@
 """
-VLSI Cell Placement Optimization
-Work in progress.
-"""
+VLSI Cell Placement 
 
-"""
-VLSI Cell Placement Optimization
+Designing computer chips is a massive real-world optimization problem. Engineers need to place thousands of components onto a tiny chip so they don’t overlap, stay compact, and keep wiring as short as possible. Doing this manually or with rigid rules quickly becomes inefficient as designs grow.
+This project explores how machine learning–driven system design can help solve that problem.
 
-This file builds a tiny synthetic chip placement problem I can optimize later.
-I generate fake cells, fake pins inside each cell, and fake connections between pins.
-Then I hand those tensors to the training loop and loss functions.
+I built a system that teaches a model how to automatically place chip components by learning where to move them over time. 
+Instead of hard-coded rules, the model continuously improves the layout by reducing wire lengths and pushing components apart when they 
+collide. It mirrors the same challenges faced in real chip design.
+
+The project is written in Python using PyTorch and focuses on turning a complex engineering problem into something a machine can learn to 
+improve step by step.
 """
 
 import os
