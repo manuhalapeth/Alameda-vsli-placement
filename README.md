@@ -1,7 +1,7 @@
 # Alameda-vsli-placement
 A machine learning system that learns to optimize chip layouts using differentiable loss functions. The model iteratively takes actions to reposition components, learning to eliminate overlaps and reduce wirelength through gradient-based feedback, helping automate a critical step in hardware design.
 
-## How to Run / Implement the Project
+## How to run / Implement the project
 
 Clone the repository:  
 bash  
@@ -17,3 +17,6 @@ python placement.py
 Run the test and evaluation script:  
 python test.py  
 
+## How to view the project
+Devpost: https://devpost.com/software/machine-learning-systems-design-for-vlsi-cell-placement-c90deu
+Demo Video: https://www.youtube.com/watch?v=CZkAVtv6hNk
